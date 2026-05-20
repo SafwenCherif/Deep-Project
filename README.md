@@ -1,4 +1,4 @@
-# NeuroScanAI — Brain Tumor Detection & Segmentation 
+# NeuroScanAI — Brain Tumor Detection & Segmentation
 
 End-to-end deep learning pipeline that **detects** and **localizes** brain tumors in MRI scans using a two-stage cascade:
 
@@ -18,27 +18,40 @@ Brain tumors are among the deadliest cancers. Early, accurate detection and loca
 
 ---
 
-# 📂 Dataset
+# 📂 Dataset & Clinical Context
 
 ## LGG MRI Segmentation Dataset (Kaggle)
 
-https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation
+[https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation](https://www.kaggle.com/datasets/mateuszbuda/lgg-mri-segmentation)
 
 ### Dataset Details
-- 110 patients
-- Paired MRI slices + expert segmentation masks
-- Class imbalance: fewer tumor-positive slices
+
+* 110 patients
+* Paired MRI slices + expert segmentation masks
+
+### The Imbalance Discovery
+
+Initial Exploratory Data Analysis (EDA) revealed a severe class imbalance across the slice distribution:
+
+| Class | Count |
+| --- | --- |
+| Healthy Slices | ~2,556 |
+| Tumor Slices | ~1,373 |
+
+This imbalance strongly influenced our architectural and mathematical decisions, requiring targeted loss-weighting to prevent the model from biasing toward healthy scans.
 
 ---
 
 # 🧠 Pipeline Overview
 
-# Stage 1 — High-Sensitivity Screening Classification (ResNet50)
+# Stage 1 — High-Sensitivity Screening Classification
 
 ## Goal
+
 Detect the presence of a brain tumor (binary classification) to act as a highly sensitive first-look clinical filter.
 
 ## System Role
+
 Serve as Stage 1 of a two-stage diagnostic pipeline. By aggressively flagging potential tumors and sending only those positive scans to a heavy downstream Segmentation model, the system minimizes compute waste while using Stage 2 to naturally filter out False Positives.
 
 ---
@@ -46,24 +59,29 @@ Serve as Stage 1 of a two-stage diagnostic pipeline. By aggressively flagging po
 ## Data Pipeline & Engineering
 
 ### Data Source
+
 Mateusz Buda LGG MRI dataset (`kaggle_3m`), processing paired `.tif` brain slices and `_mask.tif` files.
 
 ### Ground Truth Mapping
+
 Dynamically assigned labels based on mask pixel intensity:
 
-- **Class 1 / Tumour** if `mask.max() > 0`
-- **Class 0 / Healthy** otherwise
+* **Class 1 / Tumour** if `mask.max() > 0`
+* **Class 0 / Healthy** otherwise
 
-### Resolving Pipeline Bugs
-Identified and resolved severe Double-Augmentation logic bugs that were distorting training signals.
+### Resolving Pipeline Bugs & Leakage
+
+* **Double-Augmentation Fix:** Identified and resolved severe logic bugs that were distorting training signals.
+* **Leakage Prevention:** Restructured class-weight calculations to run *exclusively* on the training partition (`train_df`), ensuring downstream test set distributions never influence gradient descent.
 
 ### Class Imbalance Handling
+
 To prevent the model from biasing toward healthy scans, deterministic class weights were calculated directly from the training subset:
 
-- Tumour: `1.43`
-- Healthy: `0.77`
+* Tumour: **1.43**
+* Healthy: **0.77**
 
-These weights were applied to the loss function.
+These weights were applied directly to the loss function to penalize missed tumors heavily.
 
 ---
 
@@ -86,57 +104,46 @@ AveragePooling2D(4x4)
 
 ### Phase 1 — Baseline / Frozen
 
-- Backbone locked
-- Trained only the custom head
-- Optimizer: Adam (`learning rate = 1e-4`)
-- Loss: Categorical Cross-Entropy
+* Backbone locked
+* Trained only the custom head
+* Optimizer: Adam (`learning rate = 1e-4`)
+* Loss: **Sparse Categorical Cross-Entropy**
 
-Purpose:
-Establish a stable gradient baseline.
+**Purpose:** Establish a stable gradient baseline without destroying pretrained ImageNet filters.
 
 ### Phase 2 — Targeted Fine-Tuning
 
-- Unfroze the upper architecture for specialized medical texture learning
-- Kept the first **143 layers frozen** to preserve generic feature extraction
-- Reduced Adam learning rate to `1e-5`
-- Added:
-  - `ModelCheckpoint`
-  - `EarlyStopping`
-  - `ReduceLROnPlateau`
+* Unfroze the upper architecture for specialized medical texture learning.
+* Kept the first **143 layers frozen** to preserve generic feature extraction.
+* Reduced Adam learning rate to `1e-5`.
+* Added dynamic callbacks: `ModelCheckpoint`, `EarlyStopping`, and `ReduceLROnPlateau`.
 
-Purpose:
-Safeguard structural weights while specializing for MRI tumor patterns.
+**Purpose:** Safeguard structural weights while specializing for low-contrast MRI tumor patterns.
 
 ---
 
-# The Strategic Showdown: ResNet50 vs DenseNet121
+# ⚔️ The Strategic Showdown: ResNet50 vs DenseNet121
 
 A parallel development track was run using a **DenseNet121** backbone.
 
-## DenseNet121 Dilemma
+## The DenseNet121 Dilemma
 
-DenseNet achieved:
+As a standalone model, DenseNet achieved superior overall metrics:
 
-- ROC-AUC: `0.9722`
-- Accuracy: `91.86%` @ threshold `0.45`
+* **ROC-AUC:** 0.9722
+* **Accuracy:** 91.86% (@ threshold 0.45)
 
-However, its probability distribution was too tightly grouped, resulting in:
+However, its probability distribution was too tightly grouped. Even when pushing the model to its absolute limits, it resulted in **26 missed tumors (False Negatives)**.
 
-- `26` missed tumors (False Negatives)
+## The ResNet50 Advantage
 
-## ResNet50 Advantage
-
-Although ResNet50 had a slightly lower global ROC-AUC, its architecture allowed aggressive threshold manipulation without collapsing model behavior.
-
-This reduced missed tumors to single digits.
-
-Because this is a two-stage system, minimizing **False Negatives** was prioritized over absolute accuracy.
+Although ResNet50 had a slightly lower global ROC-AUC, its architecture allowed for aggressive threshold manipulation without collapsing model behavior. Because this is a two-stage system where the downstream segmentation model filters out false alarms, **minimizing False Negatives was prioritized over absolute accuracy.**
 
 ---
 
-# Clinical Threshold Calibration
+# 🎛️ Clinical Threshold Calibration
 
-Instead of using the mathematical default threshold `0.50`, a systematic threshold sweep (`0.15 → 0.50`) was conducted on the fine-tuned ResNet50 model.
+Instead of using the mathematical default decision threshold of `0.50`, a systematic operational sweep (`0.15 → 0.50`) was conducted on the fine-tuned ResNet50 model.
 
 ## Chosen Decision Boundary
 
@@ -148,44 +155,59 @@ Threshold = 0.25
 
 Lowering the threshold to `0.25`:
 
-- Successfully caught almost every true tumor
-- Produced only `9` False Negatives
-- Generated `85` False Positives
+* Successfully caught almost every true tumor in the test set.
+* Produced only **9 False Negatives**.
+* Generated **85 False Positives**.
 
-These False Positives are intentionally accepted because they are routed to Stage 2, where the segmentation network acts as a safety filter by returning null matrices for healthy tissue.
+These 85 False Positives are intentionally accepted because they are routed to Stage 2, where the highly specific segmentation network acts as a safety filter by returning null matrices for healthy tissue.
 
 ---
 
-# Final Stage 1 Deployment Metrics & Artifacts
+# 📦 Final Stage 1 Deployment Metrics & Artifacts
 
 ## Selected Model
+
 **ResNet50 (Phase 2 Fine-Tuned)** @ threshold `0.25`
 
-## Metrics
+## Validated Test Metrics (N=590)
 
 | Metric | Value |
-|---|---|
+| --- | --- |
 | System Screening Accuracy | 84.07% |
-| Tumour Recall | 95.59% |
+| Tumour Recall (Sensitivity) | 95.59% |
 | ROC-AUC | 0.9564 |
 | PR-AUC | 0.9214 |
-| Missed Tumors (FN) | 9 |
+| Missed Tumors (FN) | **9** |
 
 ## Exported Artifacts
 
+To ensure cross-platform compatibility for the downstream pipeline, the chosen model was exported in multiple formats:
+
 ```text
-brain_tumor_resnet50_pipeline_f.keras
-brain_tumor_resnet50_pipeline_f.weights.h5
-model_config.json
+└── brain_tumor_resnet50_pipeline_f/
+    ├── brain_tumor_resnet50_pipeline_f.keras       # Unified native Keras 3 bundle
+    ├── brain_tumor_resnet50_pipeline_f.weights.h5  # Legacy raw weights layer array
+    ├── brain_tumor_resnet50_pipeline_f.tflite      # Quantized Edge TFLite binary
+    ├── model_config.json                           # Production threshold & preprocessing metadata
+    └── saved_model/                                # Standard TF SavedModel directory for cloud serving
+
 ```
 
-Where:
-
-- `.keras` → unified deployment package
-- `.weights.h5` → legacy backend interoperability
-- `model_config.json` → runtime threshold configuration (`t = 0.25`)
-
 ---
+
+# 🧪 Notebooks (Core of the Project)
+
+## `Classification_MRI.ipynb`
+
+Contains the full classification pipeline:
+
+* Data pipeline + `tf.data` engineering
+* ResNet50 baseline + fine-tuning
+* Augmentation improvements & Bug Fixes
+* Threshold tuning & sweeping
+* DenseNet121 parallel experiments
+* Final cross-model benchmarking & export
+
 
 # Stage 2 — Deep Medical Segmentation (ResUNet)
 
@@ -465,4 +487,8 @@ docker compose up --build
 - Deployment-ready artifacts
 - Integrated FastAPI + Next.js demo stack
 
+<<<<<<< HEAD
 ---
+=======
+---
+>>>>>>> dokerization
