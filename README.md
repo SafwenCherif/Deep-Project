@@ -40,6 +40,7 @@ Initial Exploratory Data Analysis (EDA) revealed a severe class imbalance across
 
 This imbalance strongly influenced our architectural and mathematical decisions, requiring targeted loss-weighting to prevent the model from biasing toward healthy scans.
 
+
 ---
 
 # 🧠 Pipeline Overview
@@ -60,7 +61,8 @@ Serve as Stage 1 of a two-stage diagnostic pipeline. By aggressively flagging po
 
 ### Data Source
 
-Mateusz Buda LGG MRI dataset (`kaggle_3m`), processing paired `.tif` brain slices and `_mask.tif` files.
+Mateusz Buda LGG MRI dataset (`kaggle_3m`), processing paired `.tif` brain slices and `_mask.tif` files.  
+Total dataset after parsing: **3,929 image‑mask pairs** from 110 patients.
 
 ### Ground Truth Mapping
 
@@ -69,81 +71,121 @@ Dynamically assigned labels based on mask pixel intensity:
 * **Class 1 / Tumour** if `mask.max() > 0`
 * **Class 0 / Healthy** otherwise
 
+**Class distribution:** 2,556 Healthy (65%) – 1,373 Tumour (35%) — a meaningful imbalance that drives all later decisions.
+
+### Data Split (Reproducible)
+
+* First, a **15% hold‑out test set** (590 samples) is carved out and **never touched** during training or validation.
+* The remaining 3,339 samples are split again: **85% train** (2,838) and **15% validation** (501).  
+  All splits use `random_state=42`.
+
+### Data Loading & Preprocessing
+
+* `.tif` files are read with OpenCV via `tf.py_function`, converted from BGR→RGB, resized to 256×256, and normalized to [0,1].
+* Shape information is explicitly restored with `img.set_shape([256, 256, 3])`.
+* Labels are **one‑hot encoded** (`[1,0]` = Healthy, `[0,1]` = Tumour) to match the Softmax output.
+* Training pipeline uses `.shuffle(1024)`, `.batch(32)`, and `.prefetch(AUTOTUNE)` for maximum GPU utilisation.
+
 ### Resolving Pipeline Bugs & Leakage
 
-* **Double-Augmentation Fix:** Identified and resolved severe logic bugs that were distorting training signals.
-* **Leakage Prevention:** Restructured class-weight calculations to run *exclusively* on the training partition (`train_df`), ensuring downstream test set distributions never influence gradient descent.
+* **Double‑Augmentation Fix:** Identified and resolved severe logic bugs where augmentation was applied twice, distorting training signals.
+* **Ghost Checkpoint Fix:** Fresh `ModelCheckpoint` instances are created before every training phase to avoid carrying over stale best‑loss values from earlier runs.
+* **Batch‑Size Bug:** Global batch size is now computed as `16 * strategy.num_replicas_in_sync` (i.e., 32) — no hardcoded constants.
+* **Leakage Prevention:** Class weights are computed **exclusively** on the training partition (`train_df`), ensuring downstream test set distributions never influence gradient descent.
 
-### Class Imbalance Handling
+---
 
-To prevent the model from biasing toward healthy scans, deterministic class weights were calculated directly from the training subset:
+## Hardware & Distributed Training
 
-* Tumour: **1.43**
-* Healthy: **0.77**
-
-These weights were applied directly to the loss function to penalize missed tumors heavily.
+Training runs on **2 × NVIDIA Tesla T4 GPUs** using `tf.distribute.MirroredStrategy()`.  
+The model is replicated on both GPUs; each processes a sub‑batch of 16 images. Gradients are synchronised with NCCL All‑Reduce before every weight update, keeping both replicas identical.
 
 ---
 
 ## Architecture & Training Optimization
 
 ### Backbone
-Pretrained **ResNet50** using ImageNet weights.
+Pretrained **ResNet50** using ImageNet weights (`include_top=False`).
 
 ### Custom Classification Head
 
 ```text
 AveragePooling2D(4x4)
 → Flatten()
-→ Dense(256)
+→ Dense(256, ReLU)
 → Dropout(0.3)
-→ Dense(256)
+→ Dense(256, ReLU)
 → Dropout(0.3)
 → Dense(2, Softmax)
 ```
 
+---
+
 ### Phase 1 — Baseline / Frozen
 
-* Backbone locked
+* Backbone locked (`trainable = False`)
 * Trained only the custom head
-* Optimizer: Adam (`learning rate = 1e-4`)
-* Loss: **Sparse Categorical Cross-Entropy**
+* Optimizer: Adam (`learning_rate = 1e-4`)
+* Loss: **Categorical Cross‑Entropy** (labels are one‑hot encoded)
+* Callbacks: `ModelCheckpoint`, `EarlyStopping`, `ReduceLROnPlateau`
 
 **Purpose:** Establish a stable gradient baseline without destroying pretrained ImageNet filters.
 
-### Phase 2 — Targeted Fine-Tuning
+### Phase 2 — Targeted Fine‑Tuning with Class Weighting
 
-* Unfroze the upper architecture for specialized medical texture learning.
-* Kept the first **143 layers frozen** to preserve generic feature extraction.
-* Reduced Adam learning rate to `1e-5`.
-* Added dynamic callbacks: `ModelCheckpoint`, `EarlyStopping`, and `ReduceLROnPlateau`.
+* **Class Weights** computed from the training set:  
+  **Tumour: 1.433** | **Healthy: 0.768**  
+  (Penalises missed tumours ~1.87× more heavily)
+* Upper architecture unfrozen: **first 143 layers frozen**, top 32 layers trainable.
+* Learning rate reduced to **1e-5** to allow gentle specialisation without catastrophic forgetting.
+* Same loss and callback setup.
 
-**Purpose:** Safeguard structural weights while specializing for low-contrast MRI tumor patterns.
+**Purpose:** Safeguard generic low‑level features while adapting high‑level representations to low‑contrast MRI tumour patterns.
+
+### Phase 3 — Augmented Fine‑Tuning (Experiment)
+
+A clean augmented pipeline was built from scratch (no double‑augmentation) using:
+
+* Random horizontal/vertical flips (50% probability)
+* Random brightness (max_delta=0.1) and contrast (0.9–1.1)
+* Pixel clipping to [0,1] after intensity shifts
+
+This phase achieved the **highest overall accuracy (89%)** but **increased false negatives to 23** — worse than Phase 2.  
+Because recall is the critical metric for Stage 1, **Phase 2 remains the selected production model**.
 
 ---
 
 # ⚔️ The Strategic Showdown: ResNet50 vs DenseNet121
 
-A parallel development track was run using a **DenseNet121** backbone.
+A parallel development track was run using a **DenseNet121** backbone (427 layers, dense connectivity).
 
-## The DenseNet121 Dilemma
+### The DenseNet121 Dilemma
 
-As a standalone model, DenseNet achieved superior overall metrics:
+As a standalone classifier, DenseNet delivered superior global metrics:
 
-* **ROC-AUC:** 0.9722
-* **Accuracy:** 91.86% (@ threshold 0.45)
+* **ROC‑AUC:** 0.9722
+* **PR‑AUC:** 0.9559
+* **Accuracy:** 91.53% (augmented)
 
-However, its probability distribution was too tightly grouped. Even when pushing the model to its absolute limits, it resulted in **26 missed tumors (False Negatives)**.
+However, its probability outputs are more tightly compressed.  
+Even when pushing the model to its **maximum sensitivity threshold (0.15)**, it still produced **16 missed tumours** (False Negatives).  
+The default threshold (0.45) left **26 missed tumours**.
 
-## The ResNet50 Advantage
+### The ResNet50 Advantage
 
-Although ResNet50 had a slightly lower global ROC-AUC, its architecture allowed for aggressive threshold manipulation without collapsing model behavior. Because this is a two-stage system where the downstream segmentation model filters out false alarms, **minimizing False Negatives was prioritized over absolute accuracy.**
+ResNet50’s wider probability spread allows aggressive threshold lowering without collapsing behaviour.  
+At the chosen clinical threshold of **0.25**, ResNet50 yields:
+
+* **Only 9 missed tumours** (vs. 16 for DenseNet)
+* **Tumour Recall: 95.59%** (vs. 92.16% for DenseNet)
+
+In a two‑stage pipeline where Stage 2 filters false positives, **minimising false negatives is paramount** — ResNet50 wins decisively.
 
 ---
 
 # 🎛️ Clinical Threshold Calibration
 
-Instead of using the mathematical default decision threshold of `0.50`, a systematic operational sweep (`0.15 → 0.50`) was conducted on the fine-tuned ResNet50 model.
+Instead of using the mathematical default of `0.50`, a systematic sweep (`0.15 → 0.50`) was conducted on the Phase 2 ResNet50 model.
 
 ## Chosen Decision Boundary
 
@@ -151,15 +193,15 @@ Instead of using the mathematical default decision threshold of `0.50`, a system
 Threshold = 0.25
 ```
 
-## Trade-off Logic
+## Trade‑off Logic
 
 Lowering the threshold to `0.25`:
 
-* Successfully caught almost every true tumor in the test set.
-* Produced only **9 False Negatives**.
-* Generated **85 False Positives**.
+* Catches almost every true tumour in the test set.
+* Produces only **9 False Negatives**.
+* Generates **85 False Positives**.
 
-These 85 False Positives are intentionally accepted because they are routed to Stage 2, where the highly specific segmentation network acts as a safety filter by returning null matrices for healthy tissue.
+These 85 False Positives are intentionally accepted because they are routed to Stage 2, where the highly specific segmentation network acts as a safety filter by returning null masks for healthy tissue.
 
 ---
 
@@ -167,7 +209,7 @@ These 85 False Positives are intentionally accepted because they are routed to S
 
 ## Selected Model
 
-**ResNet50 (Phase 2 Fine-Tuned)** @ threshold `0.25`
+**ResNet50 (Phase 2 Fine‑Tuned)** @ threshold `0.25`
 
 ## Validated Test Metrics (N=590)
 
@@ -175,13 +217,13 @@ These 85 False Positives are intentionally accepted because they are routed to S
 | --- | --- |
 | System Screening Accuracy | 84.07% |
 | Tumour Recall (Sensitivity) | 95.59% |
-| ROC-AUC | 0.9564 |
-| PR-AUC | 0.9214 |
+| ROC‑AUC | 0.9564 |
+| PR‑AUC | 0.9214 |
 | Missed Tumors (FN) | **9** |
 
 ## Exported Artifacts
 
-To ensure cross-platform compatibility for the downstream pipeline, the chosen model was exported in multiple formats:
+To ensure cross‑platform compatibility for the downstream pipeline, the chosen model was exported in multiple formats:
 
 ```text
 └── brain_tumor_resnet50_pipeline_f/
@@ -190,7 +232,6 @@ To ensure cross-platform compatibility for the downstream pipeline, the chosen m
     ├── brain_tumor_resnet50_pipeline_f.tflite      # Quantized Edge TFLite binary
     ├── model_config.json                           # Production threshold & preprocessing metadata
     └── saved_model/                                # Standard TF SavedModel directory for cloud serving
-
 ```
 
 ---
@@ -202,12 +243,11 @@ To ensure cross-platform compatibility for the downstream pipeline, the chosen m
 Contains the full classification pipeline:
 
 * Data pipeline + `tf.data` engineering
-* ResNet50 baseline + fine-tuning
-* Augmentation improvements & Bug Fixes
-* Threshold tuning & sweeping
+* ResNet50 baseline + fine‑tuning (Phases 1 & 2)
+* Augmented Phase 3 with bug‑fixes
+* Systematic threshold tuning & sweeping
 * DenseNet121 parallel experiments
-* Final cross-model benchmarking & export
-
+* Final cross‑model benchmarking & export
 
 # Stage 2 — Deep Medical Segmentation (ResUNet)
 
