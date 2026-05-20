@@ -1,0 +1,18 @@
+# ── Web framework ─────────────────────────────────────────────────────────
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9      # required for FastAPI file uploads
+
+# ── ML stack ──────────────────────────────────────────────────────────────
+tensorflow==2.16.1           # match your training environment
+numpy==1.26.4
+
+# ── Image processing ──────────────────────────────────────────────────────
+Pillow==10.4.0
+matplotlib==3.9.2            # used for overlay & heatmap rendering
+
+# ── Data validation ────────────────────────────────────────────────────────
+pydantic==2.8.2
+
+# ── Optional: env variable management ─────────────────────────────────────
+python-dotenv==1.0.1
