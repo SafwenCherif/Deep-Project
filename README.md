@@ -462,6 +462,117 @@ The project includes a backend + frontend demo stack.
 
 ---
 
+## 🎛️ Full-Stack Application Architecture
+
+The system is engineered as a decoupled, production-ready microservice stack comprising a high-performance **FastAPI asynchronous backend** handling deep learning inference and a modern **Next.js App Router frontend** driving an interactive clinical dashboard.
+
+---
+
+### 📂 Directory Structures & Workspace Layout
+
+#### 🧠 FastAPI Backend Engine (Project Root)
+```text
+Deep-Project/
+├─ main.py                 # FastAPI Application Entry Point & Lifespan Event Handling
+├─ schemas.py              # Pydantic Response/Request Data Models
+├─ requirements.txt        # Python Application Dependency Constraints
+├─ Dockerfile              # Backend Multi-Stage Build Script
+├─ docker-compose.yml      # Multi-Container Orchestration Blueprint
+├─ .env                    # Environment Runtime Variable Management
+├─ .dockerignore           # Build Context Exclusion Manifest
+├─ ml/                     # Machine Learning Execution Modules
+│  ├─ __init__.py
+│  ├─ loader.py            # Async Model Deserialization & Custom Layer Registries
+│  ├─ pipeline.py          # Two-Stage Cascaded Inference Flow Logic
+│  └─ image_utils.py       # Preprocessing Matrices, Overlays & Base64 Encoders
+└─ models/                 # Deep Learning Binary Weights Cache
+   ├─ brain_tumor_resnet50_pipeline_f.keras
+   └─ Brain_Tumor_Segmentation_FTL_Winner.keras
+
+```
+
+#### 🎨 Next.js React Frontend (`/front`)
+
+```text
+front/
+├─ app/                    # Next.js App Router Structure
+│  ├─ favicon.ico
+│  ├─ globals.css          # Tailwind CSS Theme Tokens & Keyframe Animations
+│  ├─ layout.tsx           # Global Document Shell & Font/SEO Metadata
+│  └─ page.tsx             # Interactive Clinical State-Machine Dashboard
+├─ components/             # Reusable UI Interface Components
+│  ├─ UploadZone.tsx       # Drag-and-Drop Handler & File Binary Validation
+│  ├─ ScanningState.tsx    # Neural Network Scanning Simulation Overlay
+│  ├─ HealthyResult.tsx    # Negative Pathology Clearance UI
+│  └─ TumourResult.tsx     # Positive Pathology Dashboard (Tabs: Overlay/Heatmap)
+├─ lib/                    # Networking Client Layer
+│  └─ api.ts               # Fetch client configured for typed JSON/Base64 payloads
+├─ Dockerfile              # Optimized Node.js Production Runner Build Script
+├─ .dockerignore           # Local Node Module Cache Exclusions
+├─ next.config.ts          # Reverse Proxy Path Rewrite Configurations
+└─ tsconfig.json           # Explicit TypeScript Static Type Rules
+
+```
+
+---
+
+### ⚙️ Microservice Data Flows & Processing Modules
+
+#### 1. FastAPI Execution Workflow
+
+```text
+Client File Stream ──> [POST /predict] ──> Image Normalization 
+                                                │
+       ┌────────────────────────────────────────┘
+       ▼
+ [Stage 1: ResNet50] ──> Softmax Output Probability
+       │
+       ├─> (Prob < 0.25) ───> [PATHOLOGY CLEAR] ───> Return JSON (Healthy Result)
+       │
+       └─> (Prob >= 0.25) ──> [PATHOLOGY SUSPECTED]
+                                    │
+                                    ▼
+                             [Stage 2: ResUNet] ───> Generation of Mask Matrix
+                                                            │
+                                    ┌───────────────────────┘
+                                    ▼
+                             [image_utils.py] ─────> Render Base64 Crimson Overlays
+                                                            │
+                                                            ▼
+                                                     Return Comprehensive JSON Payload
+
+```
+
+* **`main.py`:** Initializes the microservice interface, handles security headers via CORS, and uses a lifespan event context to parse and cache both models into memory at server startup to prevent request-time overhead.
+* **`ml/loader.py`:** Handles model loading safely. It reads the model structures, pulls expected array target shapes from `model.input_shape`, and explicitly registers your custom **Focal Tversky Loss** function to successfully instantiate the segmentation model.
+* **`ml/pipeline.py`:** Controls the cascading execution flow. It channels the incoming image through Stage 1. If the target score breaks the custom **0.25 threshold**, it shifts execution into Stage 2 to isolate the tumor boundaries and generate your overlay matrices.
+* **`ml/image_utils.py`:** Handles image transforms. It reshapes raw image streams into floating-point image tensors, renders bright crimson `[235, 52, 52]` segmentation marks on the grayscale canvases, and encodes the output files into base64 strings for clean API transmission.
+* **`schemas.py`:** Standardizes your API payload structure using Pydantic, enforcing data safety across bounding values, classification logits, and spatial string results.
+
+#### 2. Next.js Frontend App Router Integration
+
+```text
+[Idle State: UploadZone] ──> Binary Validation ──> Network Request (lib/api.ts)
+                                                        │
+           ┌────────────────────────────────────────────┘
+           ▼
+[Processing State: ScanningState] ──> CSS Matrix Scanning Overlay Animation
+                                                        │
+           ┌────────────────────────────────────────────┘
+           ▼
+[Resolved State Parsing]
+   │
+   ├─> API Payload [unhealthy = false] ──> Mount <HealthyResult />
+   └─> API Payload [unhealthy = true]  ──> Mount <TumourResult /> (Render Multi-Tab View)
+
+```
+
+* **`app/page.tsx`:** Acts as the primary application engine, managing UI states through a strict lifecycle machine (`idle` → `scanning` → `result` → `error`).
+* **`lib/api.ts`:** Implements an asynchronous client wrapper that packages images into HTML5 `FormData` arrays and processes JSON payloads containing base64 images from the backend.
+* **`components/TumourResult.tsx`:** Provides an interactive multi-tab component layout that lets clinical operators toggle between the original grayscale image scans, crimson target segmentation boundaries, and specialized spatial localization matrices.
+* **`next.config.ts` Proxy Layer:** Implements clean path rewriting, configuring an internal proxy rule that dynamically rewrites requests from `/api/*` over to the internal `BACKEND_URL` network address. This decouples service interactions and prevents Cross-Origin Resource Sharing (CORS) complications during containerized production deployments.
+
+
 # 🚀 Run the Dockerized Stack
 
 ```bash
@@ -487,8 +598,4 @@ docker compose up --build
 - Deployment-ready artifacts
 - Integrated FastAPI + Next.js demo stack
 
-<<<<<<< HEAD
 ---
-=======
----
->>>>>>> dokerization
